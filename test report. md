@@ -1,0 +1,11 @@
+USBKStudies 26.7.1 — Build and Test Report
+Release: 26.7.1
+npm test: PASS (all five syntax/static/acceptance stages passed)
+Backend JavaScript syntax: PASS
+Service-worker JavaScript syntax: PASS
+Frontend inline JavaScript syntax, duplicate IDs, navigation targets and inline handler references: PASS
+Version/configuration/core-module/API-route/security markers: PASS
+HTML IDs: 139 unique IDs detected
+ZIP integrity: PASS after packaging
+Important limitation
+npm install did not finish within the restricted build environment, so dependencies were not installed and the server could not be booted here. Live PostgreSQL, AI provider, Google Books, web-search provider, SMTP, and Render deployment tests remain pending because the required network access and credentials were not available. See TEST_MATRIX.md. Passing static checks is not a claim of complete production or end-to-end testing.
