@@ -1,0 +1,728 @@
+USBKStudies 22.10.14 — Utsab AI
+CONSOLIDATED SOURCE REFERENCE
+Generated from the individual project files. Edit the individual files for deployment.
+
+
+========================================================================================
+FILE: package.json
+========================================================================================
+{
+  "name": "usbkstudies-utsab-ai",
+  "version": "22.10.14",
+  "private": true,
+  "description": "USBKStudies 22.10.14 \u2014 integrated offline-first Utsab AI learning system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node scripts/check-frontend.js",
+    "check:frontend": "node scripts/check-frontend.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1",
+    "nodemailer": "^6.10.1"
+  }
+}
+
+
+========================================================================================
+FILE: server.js
+========================================================================================
+require("dotenv").config();
+
+const express = require("express");
+const path = require("path");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
+
+const app = express();
+const PORT = Number(process.env.PORT || 10000);
+const JWT_SECRET = process.env.JWT_SECRET;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error("Set JWT_SECRET to a random value at least 32 characters long.");
+  process.exit(1);
+}
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL is required.");
+  process.exit(1);
+}
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+
+const allowedOrigins = (process.env.CORS_ORIGIN || "").split(",").map(s => s.trim()).filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  let sameOrigin = false;
+  if (origin) {
+    try { sameOrigin = new URL(origin).host === req.get("host"); } catch { sameOrigin = false; }
+    // Same-origin works by default. Cross-origin frontends must be explicitly allow-listed.
+    const allowed = allowedOrigins.length ? allowedOrigins.includes(origin) : sameOrigin;
+    if (!allowed) return res.status(403).json({ error: "Origin not allowed. Set CORS_ORIGIN to the exact frontend origin if hosted separately." });
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: "draft-7", legacyHeaders: false }));
+app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 25, standardHeaders: "draft-7", legacyHeaders: false }));
+app.use("/api/ai", rateLimit({ windowMs: 60 * 1000, limit: 15, standardHeaders: "draft-7", legacyHeaders: false }));
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000
+});
+
+const clampText = (v, max = 20000) => typeof v === "string" ? v.trim().slice(0, max) : "";
+const asSafeUser = r => ({ id: String(r.id), name: r.name, role: r.role, className: r.class_name, school: r.school, emailOrPhone: r.email_or_phone, createdAt: r.created_at });
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'student' CHECK (role IN ('student','teacher')),
+      class_name VARCHAR(80) NOT NULL DEFAULT '', school VARCHAR(160) NOT NULL DEFAULT '',
+      email_or_phone VARCHAR(190) NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS notes (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(200) NOT NULL, content TEXT NOT NULL DEFAULT '', subject VARCHAR(100) NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS flashcards (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      subject VARCHAR(100) NOT NULL DEFAULT '', front TEXT NOT NULL, back TEXT NOT NULL,
+      due_at DATE, last_reviewed_at TIMESTAMPTZ, review_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS library_items (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(200) NOT NULL, item_type VARCHAR(60) NOT NULL DEFAULT 'resource',
+      content TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role VARCHAR(20) NOT NULL CHECK (role IN ('user','assistant')),
+      content TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS study_tasks (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(200) NOT NULL, subject VARCHAR(100) NOT NULL DEFAULT '',
+      task_type VARCHAR(60) NOT NULL DEFAULT 'study', due_date DATE,
+      notes TEXT NOT NULL DEFAULT '', completed BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_concepts (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      concept VARCHAR(200) NOT NULL, prerequisite TEXT NOT NULL DEFAULT '',
+      related TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS exam_logs (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      subject VARCHAR(100) NOT NULL DEFAULT '', exam_name VARCHAR(160) NOT NULL DEFAULT '',
+      score NUMERIC(7,2), total NUMERIC(7,2), mistake TEXT NOT NULL DEFAULT '',
+      correction TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS app_settings (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS reset_user_idx ON password_reset_tokens(user_id, expires_at DESC);
+    CREATE INDEX IF NOT EXISTS notes_user_idx ON notes(user_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS flashcards_user_idx ON flashcards(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS library_user_idx ON library_items(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS chats_user_idx ON chat_messages(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS tasks_user_idx ON study_tasks(user_id, due_date);
+  `);
+}
+
+function authRequired(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!token) return res.status(401).json({ error: "Please log in first." });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: "Session expired. Please log in again." }); }
+}
+function ownerId(req) { return req.user.sub; }
+
+app.get("/api/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({
+      ok: true, service: "USBKStudies 22.10.14", database: "connected",
+      aiConfigured: Boolean(process.env.GROW_API_KEY && process.env.GROW_API_BASE_URL && process.env.GROW_API_MODEL),
+      liveSearchConfigured: Boolean(process.env.WEB_SEARCH_API_KEY && process.env.WEB_SEARCH_BASE_URL),
+      passwordResetConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.MAIL_FROM),
+      offlineMode: "available in browser; AI and cloud sync require internet"
+    });
+  } catch { res.status(503).json({ ok: false, service: "USBKStudies 22.10.14", database: "unavailable" }); }
+});
+
+app.post("/api/auth/register", async (req, res, next) => {
+  try {
+    const name = clampText(req.body.name, 100), role = req.body.role === "teacher" ? "teacher" : "student";
+    const className = clampText(req.body.className, 80), school = clampText(req.body.school, 160);
+    const emailOrPhone = clampText(req.body.emailOrPhone, 190).toLowerCase();
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    if (name.length < 2 || emailOrPhone.length < 4 || password.length < 10) return res.status(400).json({ error: "Enter a name, valid email/phone, and password of at least 10 characters." });
+    const exists = await pool.query("SELECT 1 FROM users WHERE email_or_phone=$1", [emailOrPhone]);
+    if (exists.rowCount) return res.status(409).json({ error: "An account with this email/phone already exists." });
+    const hash = await bcrypt.hash(password, 12);
+    const r = await pool.query("INSERT INTO users(name,role,class_name,school,email_or_phone,password_hash) VALUES($1,$2,$3,$4,$5,$6) RETURNING *", [name,role,className,school,emailOrPhone,hash]);
+    const user = asSafeUser(r.rows[0]);
+    const token = jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.status(201).json({ user, token });
+  } catch (e) { next(e); }
+});
+app.post("/api/auth/login", async (req, res, next) => {
+  try {
+    const login = clampText(req.body.emailOrPhone, 190).toLowerCase();
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const r = await pool.query("SELECT * FROM users WHERE email_or_phone=$1", [login]);
+    const row = r.rows[0];
+    if (!row || !(await bcrypt.compare(password, row.password_hash))) return res.status(401).json({ error: "Incorrect email/phone or password." });
+    const user = asSafeUser(row), token = jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ user, token });
+  } catch (e) { next(e); }
+});
+app.get("/api/auth/me", authRequired, async (req,res,next) => {
+  try { const r=await pool.query("SELECT * FROM users WHERE id=$1",[ownerId(req)]); if(!r.rowCount)return res.status(404).json({error:"Account not found."}); res.json({user:asSafeUser(r.rows[0])}); } catch(e){next(e);}
+});
+app.patch("/api/auth/profile", authRequired, async (req,res,next) => {
+  try {
+    const name=clampText(req.body.name,100), className=clampText(req.body.className,80), school=clampText(req.body.school,160);
+    if(name.length<2)return res.status(400).json({error:"Name must contain at least 2 characters."});
+    const r=await pool.query("UPDATE users SET name=$1,class_name=$2,school=$3 WHERE id=$4 RETURNING *",[name,className,school,ownerId(req)]);
+    res.json({user:asSafeUser(r.rows[0])});
+  }catch(e){next(e);}
+});
+app.post("/api/auth/change-password", authRequired, async (req,res,next) => {
+  try {
+    const oldPassword=String(req.body.oldPassword||""), newPassword=String(req.body.newPassword||"");
+    if(newPassword.length<10)return res.status(400).json({error:"New password must be at least 10 characters."});
+    const r=await pool.query("SELECT password_hash FROM users WHERE id=$1",[ownerId(req)]);
+    if(!r.rowCount||!(await bcrypt.compare(oldPassword,r.rows[0].password_hash)))return res.status(401).json({error:"Current password is incorrect."});
+    const hash=await bcrypt.hash(newPassword,12);
+    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2",[hash,ownerId(req)]);
+    res.json({ok:true,message:"Password changed. Please log in again on other devices."});
+  }catch(e){next(e);}
+});
+// Password reset: requires SMTP environment variables and email-based account identifier.
+app.post("/api/auth/password-reset/request", async (req,res,next) => {
+  try {
+    const identifier=clampText(req.body.emailOrPhone,190).toLowerCase();
+    // Always return the same public message to avoid account enumeration.
+    const generic={ok:true,message:"If this account uses an email address and reset mail is configured, instructions will be sent."};
+    if(!identifier || !identifier.includes("@") || !process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS || !process.env.MAIL_FROM) return res.json(generic);
+    const u=await pool.query("SELECT id,email_or_phone FROM users WHERE email_or_phone=$1",[identifier]);
+    if(!u.rowCount)return res.json(generic);
+    const raw=crypto.randomBytes(32).toString("hex"), hash=crypto.createHash("sha256").update(raw).digest("hex");
+    await pool.query("DELETE FROM password_reset_tokens WHERE expires_at < NOW() OR used_at IS NOT NULL");
+    await pool.query("UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL",[u.rows[0].id]);
+    await pool.query("INSERT INTO password_reset_tokens(user_id,token_hash,expires_at) VALUES($1,$2,NOW()+INTERVAL '30 minutes')",[u.rows[0].id,hash]);
+    const transporter=nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||"false")==="true",auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});
+    const base=(process.env.APP_BASE_URL||"").replace(/\/$/,"");
+    const resetUrl=base?`${base}/?resetToken=${raw}`:null;
+    await transporter.sendMail({from:process.env.MAIL_FROM,to:identifier,subject:"USBKStudies password reset",text:`A password reset was requested for your USBKStudies account.\n\n${resetUrl?`Open this link within 30 minutes: ${resetUrl}`:`Use this reset token within 30 minutes: ${raw}`}\n\nIf you did not request this, ignore this email.`});
+    res.json(generic);
+  }catch(e){next(e);}
+});
+app.post("/api/auth/password-reset/confirm", async(req,res,next)=>{
+  try {
+    const raw=clampText(req.body.token,200), password=typeof req.body.newPassword==="string"?req.body.newPassword:"";
+    if(raw.length<32||password.length<10)return res.status(400).json({error:"A valid reset token and a password of at least 10 characters are required."});
+    const hash=crypto.createHash("sha256").update(raw).digest("hex");
+    const r=await pool.query("SELECT id,user_id FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at>NOW()",[hash]);
+    if(!r.rowCount)return res.status(400).json({error:"Reset token is invalid or expired. Request a new one."});
+    const passHash=await bcrypt.hash(password,12);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE users SET password_hash=$1 WHERE id=$2", [passHash, r.rows[0].user_id]);
+      await client.query("UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL", [r.rows[0].user_id]);
+      await client.query("COMMIT");
+    } catch (txError) {
+      await client.query("ROLLBACK");
+      throw txError;
+    } finally { client.release(); }
+    res.json({ok:true,message:"Password reset successful. Log in with the new password."});
+  }catch(e){next(e);}
+});
+
+async function listRoute(table, fields, order, req, res, next) {
+  try { const r=await pool.query(`SELECT ${fields} FROM ${table} WHERE user_id=$1 ORDER BY ${order} LIMIT 500`,[ownerId(req)]); res.json({items:r.rows}); } catch(e){next(e);}
+}
+app.get("/api/notes",authRequired,(req,res,next)=>listRoute("notes","id,title,content,subject,created_at,updated_at","updated_at DESC",req,res,next));
+app.post("/api/notes",authRequired,async(req,res,next)=>{try{const title=clampText(req.body.title,200),content=clampText(req.body.content,50000),subject=clampText(req.body.subject,100);if(!title)return res.status(400).json({error:"Title required."});const r=await pool.query("INSERT INTO notes(user_id,title,content,subject) VALUES($1,$2,$3,$4) RETURNING *",[ownerId(req),title,content,subject]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+app.patch("/api/notes/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("UPDATE notes SET title=$1,content=$2,subject=$3,updated_at=NOW() WHERE id=$4 AND user_id=$5 RETURNING *",[clampText(req.body.title,200),clampText(req.body.content,50000),clampText(req.body.subject,100),req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Note not found."});res.json({item:r.rows[0]});}catch(e){next(e);}});
+app.delete("/api/notes/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("DELETE FROM notes WHERE id=$1 AND user_id=$2",[req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Note not found."});res.json({ok:true});}catch(e){next(e);}});
+
+app.get("/api/flashcards",authRequired,(req,res,next)=>listRoute("flashcards","id,subject,front,back,due_at,last_reviewed_at,review_count,created_at","created_at DESC",req,res,next));
+app.post("/api/flashcards",authRequired,async(req,res,next)=>{try{const front=clampText(req.body.front,5000),back=clampText(req.body.back,10000),subject=clampText(req.body.subject,100);if(!front||!back)return res.status(400).json({error:"Question and answer required."});const r=await pool.query("INSERT INTO flashcards(user_id,subject,front,back,due_at) VALUES($1,$2,$3,$4,$5) RETURNING *",[ownerId(req),subject,front,back,req.body.dueAt||null]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+app.post("/api/flashcards/:id/review",authRequired,async(req,res,next)=>{try{const rating=["again","hard","good","easy"].includes(req.body.rating)?req.body.rating:"good";const days={again:0,hard:1,good:3,easy:7}[rating];const r=await pool.query("UPDATE flashcards SET review_count=review_count+1,last_reviewed_at=NOW(),due_at=CURRENT_DATE + $1::int WHERE id=$2 AND user_id=$3 RETURNING *",[days,req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Flashcard not found."});res.json({item:r.rows[0]});}catch(e){next(e);}});
+app.delete("/api/flashcards/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("DELETE FROM flashcards WHERE id=$1 AND user_id=$2",[req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Flashcard not found."});res.json({ok:true});}catch(e){next(e);}});
+
+app.get("/api/library",authRequired,(req,res,next)=>listRoute("library_items","id,title,item_type,content,created_at","created_at DESC",req,res,next));
+app.post("/api/library",authRequired,async(req,res,next)=>{try{const title=clampText(req.body.title,200);if(!title)return res.status(400).json({error:"Title required."});const r=await pool.query("INSERT INTO library_items(user_id,title,item_type,content) VALUES($1,$2,$3,$4) RETURNING *",[ownerId(req),title,clampText(req.body.itemType||"resource",60),clampText(req.body.content,50000)]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+app.delete("/api/library/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("DELETE FROM library_items WHERE id=$1 AND user_id=$2",[req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Library item not found."});res.json({ok:true});}catch(e){next(e);}});
+
+app.get("/api/chat/history",authRequired,async(req,res,next)=>{try{const r=await pool.query("SELECT id,role,content,created_at FROM (SELECT * FROM chat_messages WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100) x ORDER BY created_at ASC",[ownerId(req)]);res.json({items:r.rows});}catch(e){next(e);}});
+app.delete("/api/chat/history",authRequired,async(req,res,next)=>{try{await pool.query("DELETE FROM chat_messages WHERE user_id=$1",[ownerId(req)]);res.json({ok:true});}catch(e){next(e);}});
+
+async function callAI(messages, temperature=0.5) {
+  const key=process.env.GROW_API_KEY, base=(process.env.GROW_API_BASE_URL||"").replace(/\/+$/,""), endpoint=process.env.GROW_API_ENDPOINT||"/chat/completions", model=process.env.GROW_API_MODEL;
+  if(!key||!base||!model){const e=new Error("Grow AI is not configured. Add the provider's correct key, base URL, endpoint and model in Render Environment Variables.");e.status=503;throw e;}
+  const url=base+(endpoint.startsWith("/")?endpoint:"/"+endpoint);
+  const response=await fetch(url,{method:"POST",headers:{"Authorization":`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify({model,messages,temperature}),signal:AbortSignal.timeout(Math.max(5000,Number(process.env.AI_REQUEST_TIMEOUT_MS)||45000))});
+  const raw=await response.text();let data={};try{data=JSON.parse(raw);}catch{}
+  if(!response.ok){const e=new Error(data?.error?.message||`AI provider returned HTTP ${response.status}.`);e.status=502;throw e;}
+  const rawAnswer=data?.choices?.[0]?.message?.content;
+  const answer=typeof rawAnswer==="string"?rawAnswer:(Array.isArray(rawAnswer)?rawAnswer.map(x=>x?.text||"").join("\n"):"");
+  if(typeof answer!=="string"||!answer.trim()){const e=new Error("Provider response format was not recognized. Verify Grow API documentation and response schema.");e.status=502;throw e;}
+  return answer.trim();
+}
+app.post("/api/ai/chat",authRequired,async(req,res,next)=>{try{
+  const message=clampText(req.body.message,12000), language=clampText(req.body.language||"Auto-detect",40);
+  if(!message)return res.status(400).json({error:"Enter a question."});
+  const history=Array.isArray(req.body.history)?req.body.history.slice(-8).filter(m=>m&&["user","assistant"].includes(m.role)&&typeof m.content==="string").map(m=>({role:m.role,content:m.content.slice(0,4000)})):[];
+  const system=`You are Utsab AI, a multilingual study tutor for school students. Reply in ${language==="Auto-detect"?"the user's language":language}. Teach step by step, encourage independent learning, flag uncertainty, and never invent citations or claim live search if none was performed. Keep age-appropriate and respectful.`;
+  let userContent=message;
+  const attachments=Array.isArray(req.body.attachments)?req.body.attachments.slice(0,3):[];
+  const imageParts=[];
+  for(const a of attachments){if(a&&typeof a.dataUrl==="string"&&/^data:image\/(png|jpeg|jpg|webp|gif);base64,/i.test(a.dataUrl)&&a.dataUrl.length<=6_000_000){imageParts.push({type:"image_url",image_url:{url:a.dataUrl}});}}
+  if(imageParts.length) userContent=[{type:"text",text:message},{...imageParts[0]} ,...imageParts.slice(1)];
+  const answer=await callAI([{role:"system",content:system},...history,{role:"user",content:userContent}]);
+  await pool.query("INSERT INTO chat_messages(user_id,role,content) VALUES($1,'user',$2),($1,'assistant',$3)",[ownerId(req),message,answer]);
+  res.json({answer});
+}catch(e){next(e);}});
+
+app.post("/api/ai/study-pack",authRequired,async(req,res,next)=>{try{
+  const topic=clampText(req.body.topic,3000);if(!topic)return res.status(400).json({error:"Topic required."});
+  const prompt=`Create a complete school study pack in ${clampText(req.body.language||"Bengali",40)}. Class: ${clampText(req.body.className,80)||"unspecified"}. Subject: ${clampText(req.body.subject,100)||"unspecified"}. Topic: ${topic}. Include concise notes, step-by-step explanation, 5 MCQs with answers, 5 flashcards, common mistakes, quick revision, and 3 self-test questions. Clearly state when syllabus details are uncertain.`;
+  res.json({answer:await callAI([{role:"system",content:"You are Utsab AI, an accurate study material creator."},{role:"user",content:prompt}])});
+}catch(e){next(e);}});
+app.post("/api/ai/previous-questions",authRequired,async(req,res,next)=>{try{
+  const subject=clampText(req.body.subject,100),className=clampText(req.body.className,80),exam=clampText(req.body.exam,120);
+  if(!subject||!className||!exam)return res.status(400).json({error:"Subject, class and exam are required."});
+  const prompt=`In ${clampText(req.body.language||"Bengali",40)}, help prepare for ${exam}, class ${className}, subject ${subject}, topic ${clampText(req.body.topic,1500)||"general syllabus"}. Do not pretend generated questions are actual past-paper questions. Label them as practice questions unless a verified source is supplied. Provide topic-wise questions, answer hints and a checking strategy.`;
+  res.json({answer:await callAI([{role:"system",content:"Never fabricate official past questions or citations."},{role:"user",content:prompt}])});
+}catch(e){next(e);}});
+app.post("/api/ai/tutor-mode",authRequired,async(req,res,next)=>{try{
+  const mode=["socratic","mistake-detective","examiner","teacher-simulator","explain","revision","concept-map"].includes(req.body.mode)?req.body.mode:"explain";
+  const prompt=clampText(req.body.prompt,10000);if(!prompt)return res.status(400).json({error:"Provide a question or work to review."});
+  const language=clampText(req.body.language||"Auto-detect",40);
+  const instructions={
+    socratic:"Use Socratic tutoring: ask one guiding question at a time and help the student reason instead of immediately giving away the final answer.",
+    "mistake-detective":"Review the student's work, identify the first likely error, explain why, and provide a corrected method.",
+    examiner:"Act as a fair school examiner: ask a question, wait for the student's response, then assess it using a clear rubric.",
+    "teacher-simulator":"Act as a patient school teacher: teach the requested concept step by step, check understanding, give an age-appropriate example, and then ask one short practice question.",
+    explain:"Explain the topic simply, then give an example and a short check question.",
+    revision:"Make a compact revision sheet, recall prompts, and spaced-repetition suggestions.",
+    "concept-map":"Return a text-based concept map with main idea, branches, prerequisites, and relationships."
+  };
+  res.json({answer:await callAI([{role:"system",content:"You are Utsab AI. Reply in "+(language==="Auto-detect"?"the user's language":language)+". "+instructions[mode]},{role:"user",content:prompt}])});
+}catch(e){next(e);}});
+
+app.get("/api/tasks",authRequired,(req,res,next)=>listRoute("study_tasks","id,title,subject,task_type,due_date,notes,completed,created_at","completed ASC, due_date ASC NULLS LAST",req,res,next));
+app.post("/api/tasks",authRequired,async(req,res,next)=>{try{const title=clampText(req.body.title,200);if(!title)return res.status(400).json({error:"Task title required."});const r=await pool.query("INSERT INTO study_tasks(user_id,title,subject,task_type,due_date,notes) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[ownerId(req),title,clampText(req.body.subject,100),clampText(req.body.taskType||"study",60),req.body.dueDate||null,clampText(req.body.notes,10000)]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+app.patch("/api/tasks/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("UPDATE study_tasks SET completed=$1 WHERE id=$2 AND user_id=$3 RETURNING *",[Boolean(req.body.completed),req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Task not found."});res.json({item:r.rows[0]});}catch(e){next(e);}});
+app.delete("/api/tasks/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("DELETE FROM study_tasks WHERE id=$1 AND user_id=$2",[req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Task not found."});res.json({ok:true});}catch(e){next(e);}});
+
+app.get("/api/knowledge",authRequired,(req,res,next)=>listRoute("knowledge_concepts","id,concept,prerequisite,related,notes,created_at","created_at DESC",req,res,next));
+app.post("/api/knowledge",authRequired,async(req,res,next)=>{try{const concept=clampText(req.body.concept,200);if(!concept)return res.status(400).json({error:"Concept required."});const r=await pool.query("INSERT INTO knowledge_concepts(user_id,concept,prerequisite,related,notes) VALUES($1,$2,$3,$4,$5) RETURNING *",[ownerId(req),concept,clampText(req.body.prerequisite,2000),clampText(req.body.related,2000),clampText(req.body.notes,10000)]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+app.delete("/api/knowledge/:id",authRequired,async(req,res,next)=>{try{const r=await pool.query("DELETE FROM knowledge_concepts WHERE id=$1 AND user_id=$2",[req.params.id,ownerId(req)]);if(!r.rowCount)return res.status(404).json({error:"Concept not found."});res.json({ok:true});}catch(e){next(e);}});
+
+app.get("/api/exam-logs",authRequired,(req,res,next)=>listRoute("exam_logs","id,subject,exam_name,score,total,mistake,correction,created_at","created_at DESC",req,res,next));
+app.post("/api/exam-logs",authRequired,async(req,res,next)=>{try{const r=await pool.query("INSERT INTO exam_logs(user_id,subject,exam_name,score,total,mistake,correction) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[ownerId(req),clampText(req.body.subject,100),clampText(req.body.examName,160),req.body.score===undefined||req.body.score===""?null:Number(req.body.score),req.body.total===undefined||req.body.total===""?null:Number(req.body.total),clampText(req.body.mistake,10000),clampText(req.body.correction,10000)]);res.status(201).json({item:r.rows[0]});}catch(e){next(e);}});
+
+app.get("/api/settings",authRequired,async(req,res,next)=>{try{const r=await pool.query("SELECT settings FROM app_settings WHERE user_id=$1",[ownerId(req)]);res.json({settings:r.rows[0]?.settings||{}});}catch(e){next(e);}});
+app.put("/api/settings",authRequired,async(req,res,next)=>{try{const settings=req.body&&typeof req.body==="object"&&!Array.isArray(req.body)?req.body:{};const r=await pool.query("INSERT INTO app_settings(user_id,settings) VALUES($1,$2::jsonb) ON CONFLICT(user_id) DO UPDATE SET settings=EXCLUDED.settings,updated_at=NOW() RETURNING settings",[ownerId(req),JSON.stringify(settings)]);res.json({settings:r.rows[0].settings});}catch(e){next(e);}});
+
+app.get("/api/dashboard",authRequired,async(req,res,next)=>{try{
+  const id=ownerId(req);
+  const [notes,cards,library,tasks,exams,concepts]=await Promise.all([
+    pool.query("SELECT COUNT(*)::int n FROM notes WHERE user_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int n FROM flashcards WHERE user_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int n FROM library_items WHERE user_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int n, COUNT(*) FILTER (WHERE completed)::int done FROM study_tasks WHERE user_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int n, AVG(CASE WHEN total>0 THEN score/total*100 END) avg FROM exam_logs WHERE user_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int n FROM knowledge_concepts WHERE user_id=$1",[id])
+  ]);
+  res.json({notes:notes.rows[0].n,flashcards:cards.rows[0].n,library:library.rows[0].n,tasks:tasks.rows[0],exams:exams.rows[0],concepts:concepts.rows[0].n});
+}catch(e){next(e);}});
+
+// Live web research adapter: Tavily-compatible endpoint. Set WEB_SEARCH_API_KEY; optional WEB_SEARCH_BASE_URL.
+app.post("/api/research",authRequired,async(req,res,next)=>{
+  try {
+    const query=clampText(req.body.query,1000);
+    if(!query)return res.status(400).json({error:"Enter a research question."});
+    const key=process.env.WEB_SEARCH_API_KEY;
+    if(!key){const e=new Error("Live Web Research needs WEB_SEARCH_API_KEY in Render Environment Variables. Set it to a key from your chosen supported search provider.");e.status=503;throw e;}
+    const base=(process.env.WEB_SEARCH_BASE_URL||"https://api.tavily.com").replace(/\/+$/,"");
+    const endpoint=process.env.WEB_SEARCH_ENDPOINT||"/search";
+    const url=base+(endpoint.startsWith("/")?endpoint:"/"+endpoint);
+    const response=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({api_key:key,query,search_depth:process.env.WEB_SEARCH_DEPTH||"basic",max_results:Math.min(10,Math.max(1,Number(req.body.maxResults)||5)),include_answer:true,include_raw_content:false}),signal:AbortSignal.timeout(Math.max(5000,Number(process.env.WEB_SEARCH_TIMEOUT_MS)||20000))});
+    const raw=await response.text();let data={};try{data=JSON.parse(raw)}catch{}
+    if(!response.ok){const e=new Error(data?.message||data?.detail||`Search provider returned HTTP ${response.status}. Check WEB_SEARCH_BASE_URL/ENDPOINT and provider API format.`);e.status=502;throw e;}
+    const results=(Array.isArray(data.results)?data.results:[]).map(x=>({title:clampText(x.title,500),url:clampText(x.url,2000),content:clampText(x.content||x.snippet,4000),score:Number(x.score)||null})).filter(x=>x.url);
+    res.json({query,answer:clampText(data.answer,6000),results,provider:"configured web search",checkedAt:new Date().toISOString()});
+  }catch(e){next(e);}
+});
+
+app.use(express.static(path.join(__dirname),{index:"index.html",etag:true,maxAge:process.env.NODE_ENV==="production"?"1h":0}));
+app.get("*",(_req,res)=>res.sendFile(path.join(__dirname,"index.html")));
+app.use((err,_req,res,_next)=>{console.error(err.message||err);const status=Number.isInteger(err.status)?err.status:500;res.status(status).json({error:status===500?"Server error. Check Render logs.":err.message});});
+
+initDb().then(()=>app.listen(PORT,"0.0.0.0",()=>console.log(`USBKStudies 22.10.14 listening on ${PORT}`))).catch(e=>{console.error("Database initialization failed:",e.message);process.exit(1);});
+
+
+========================================================================================
+FILE: index.html
+========================================================================================
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#08111f">
+<title>USBKStudies 22.10.14 — Utsab AI</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+:root{color-scheme:dark;--bg:#08111f;--panel:#111d30;--panel2:#17263c;--line:#2a3d57;--text:#edf4ff;--muted:#a6b7ce;--blue:#3b82f6;--red:#ef4444;--green:#34d399}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Noto Sans Bengali",sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
+.top{position:sticky;top:0;z-index:8;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;background:#08111ff2;border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}.brand{font-weight:850}.muted,.sub{color:var(--muted)}.sub{font-size:12px}.wrap{max-width:1240px;margin:auto;padding:18px 14px 100px}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:16px}.side,.panel,.feature{background:var(--panel);border:1px solid var(--line);border-radius:15px}.side{padding:9px;height:max-content;position:sticky;top:78px}.nav{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--muted);border-radius:9px;padding:9px 10px;margin:2px 0}.nav.active,.nav:hover{background:var(--panel2);color:var(--text)}.panel{padding:17px;margin-bottom:15px;min-width:0}.hero{background:linear-gradient(125deg,#142b4b,#111d30);padding:24px;border:1px solid var(--line);border-radius:18px;margin-bottom:16px}.hero h1{font-size:clamp(26px,4vw,38px);margin:5px 0}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}.feature{color:var(--text);padding:14px;text-align:left;min-height:100px}.feature strong{display:block;margin-bottom:5px}.feature:hover{border-color:var(--blue)}.row{display:flex;gap:9px;flex-wrap:wrap;align-items:end}.row>*{flex:1;min-width:120px}.field{display:block;width:100%;margin:6px 0 12px;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#091525;color:var(--text)}label{display:block}.btn{border:0;border-radius:10px;padding:10px 14px;background:var(--blue);color:white;font-weight:650}.btn.secondary{background:var(--panel2);border:1px solid var(--line);color:var(--text)}.btn.danger{background:#7f1d1d}.btn.small{font-size:12px;padding:6px 9px}.section{display:none}.section.active{display:block}.status{color:var(--muted);font-size:13px;min-height:20px}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 9px;color:var(--muted);font-size:12px}.item{border:1px solid var(--line);border-radius:12px;padding:12px;margin:9px 0;overflow-wrap:anywhere}.item h3{font-size:16px;margin:0 0 6px}.chat{height:360px;overflow:auto;background:#091525;border:1px solid var(--line);border-radius:12px;padding:10px}.msg{white-space:pre-wrap;overflow-wrap:anywhere;padding:11px;border-radius:11px;margin:8px 0}.msg.user{background:#17345c;margin-left:8%}.msg.ai{background:#172438;margin-right:8%}.hide{display:none!important}.bottom{display:none}.watermark{position:fixed;right:12px;bottom:5px;color:#7890ae80;font-size:11px;pointer-events:none}details{margin:7px 0}hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+@media(max-width:800px){.layout{display:block}.side{display:none}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bottom{display:flex;position:fixed;bottom:0;left:0;right:0;overflow:auto;z-index:10;background:#08111ff5;border-top:1px solid var(--line);padding:5px}.bottom button{min-width:70px;flex:1;background:transparent;border:0;color:var(--muted);font-size:11px;padding:7px}.bottom button.active{background:var(--panel2);border-radius:8px;color:var(--text)}.top .sub{display:none}.wrap{padding-bottom:100px}}
+@media print{.top,.side,.bottom,.no-print,.watermark{display:none!important}body{background:white;color:black}.wrap{padding:0}.panel,.hero{background:white;color:black;border:0}.section{display:none!important}.section.active{display:block!important}}
+</style>
+</head>
+<body>
+<header class="top"><div><div class="brand">USBKStudies 22.10.14</div><div class="sub">Utsab AI Learning System</div></div><div class="row" style="flex:0;align-items:center"><span class="pill" id="userBadge">Guest</span><button class="btn secondary" id="authButton" onclick="show('auth')">Login / Register</button></div></header>
+<div class="wrap"><div class="layout"><aside class="side no-print" id="sideNav"></aside><main style="min-width:0">
+<section class="section active" id="home"><div class="hero"><span class="pill">Learn With Utsab</span><h1>আপনার ব্যক্তিগত AI Study System</h1><p class="muted">এক জায়গায় শেখা, অনুশীলন, নোট, পরিকল্পনা ও অগ্রগতি।</p><div class="row no-print"><button class="btn" onclick="show('ai')">Utsab AI</button><button class="btn secondary" onclick="show('study')">Study Pack</button></div></div><div class="grid" id="features"></div><div class="panel"><h2>Founder Dashboard</h2><p class="muted">নিজের অ্যাপের আইডিয়া, কাজ, সমস্যা ও পরীক্ষা লিখে রাখুন।</p><div class="row"><input class="field" id="founderTitle" placeholder="Task / idea"><select class="field" id="founderType"><option>Idea</option><option>Roadmap</option><option>Bug</option><option>Experiment</option></select><button class="btn" onclick="addFounder()">Add</button></div><div id="founderList"></div></div></section>
+<section class="section" id="offline"><div class="panel"><h2>Offline Study Mode</h2><p class="muted">ইন্টারনেট বা API ছাড়াই এই অংশে নোট, প্রশ্ন, ফ্ল্যাশকার্ড, ছোট রিভিশন, ক্যালকুলেটর ও টাইমার ব্যবহার করা যাবে। তথ্য এই ডিভাইসের ব্রাউজারে থাকে; অন্য ডিভাইসে নিজে Export/Import করতে হবে। প্রথমবার অ্যাপটি অনলাইনে খুলে Service Worker cache তৈরি করুন।</p><div class="row"><button class="btn secondary" onclick="offlineExport()">Export offline data</button><button class="btn secondary" onclick="document.getElementById('offlineImportFile').click()">Import offline data</button><input id="offlineImportFile" type="file" accept="application/json" hidden onchange="offlineImport(this.files)"></div><hr><h3>Offline quick revision</h3><label>Subject / topic<input id="offTopic" class="field" placeholder="যেমন: গণিত — শতকরা"></label><label>What do you remember?<textarea id="offRecall" class="field" placeholder="বই না দেখে নিজের ভাষায় লিখুন"></textarea></label><button class="btn" onclick="saveOfflineRevision()">Save revision</button><div id="offRevisionList"></div><hr><h3>Offline notes</h3><label>Title<input id="offNoteTitle" class="field"></label><label>Subject<input id="offNoteSubject" class="field"></label><label>Content<textarea id="offNoteContent" class="field" rows="4"></textarea></label><button class="btn" onclick="saveOfflineNote()">Save offline note</button><div id="offNoteList"></div><hr><h3>Offline flashcards</h3><label>Question / front<textarea id="offCardFront" class="field"></textarea></label><label>Answer / back<textarea id="offCardBack" class="field"></textarea></label><button class="btn" onclick="saveOfflineCard()">Save flashcard</button><div id="offCardList"></div><hr><h3>Offline question bank</h3><label>Question<textarea id="offQ" class="field"></textarea></label><label>Answer<textarea id="offA" class="field"></textarea></label><button class="btn" onclick="saveOfflineQuestion()">Save question</button><div id="offQuestionList"></div><p id="offlineStatus" class="status" aria-live="polite"></p></div></section>
+<section class="section" id="auth"><div class="panel"><h2>Student / Teacher Account</h2><div class="row"><button class="btn secondary" onclick="authMode='login';renderAuth()">Login</button><button class="btn secondary" onclick="authMode='register';renderAuth()">Register</button></div><form id="authForm"><div id="registerFields" class="hide"><label>Name<input class="field" name="name"></label><label>Role<select class="field" name="role"><option value="student">Student</option><option value="teacher">Teacher</option></select></label><div class="row"><label>Class<input class="field" name="className"></label><label>School<input class="field" name="school"></label></div></div><label>Email or Phone<input class="field" name="emailOrPhone" required autocomplete="username"></label><label>Password<input class="field" name="password" type="password" minlength="10" required autocomplete="current-password"></label><button class="btn" id="authSubmit">Login</button></form><p class="status" id="authStatus"></p><button class="btn secondary" onclick="requestReset()">Forgot Password</button> <button class="btn secondary hide" id="logoutBtn" onclick="logout()">Logout</button><hr><h3>Profile</h3><label>Name<input id="profileName" class="field"></label><label>Class<input id="profileClass" class="field"></label><label>School<input id="profileSchool" class="field"></label><button class="btn secondary" onclick="saveProfile()">Save profile</button><p class="status" id="profileStatus"></p><h3>Change password</h3><input id="oldPass" class="field" type="password" placeholder="Current password"><input id="newPass" class="field" type="password" placeholder="New password (10+ characters)"><button class="btn secondary" onclick="changePassword()">Change password</button><p class="status" id="passwordStatus"></p></div></section>
+<section class="section" id="ai"><div class="panel"><h2>Utsab AI</h2><label>Language<select id="aiLang" class="field"><option>Auto-detect</option><option>Bengali</option><option>English</option><option>Hindi</option><option>Urdu</option><option>Arabic</option><option>Chinese</option><option>Japanese</option><option>Korean</option><option>Spanish</option><option>French</option><option>German</option><option>Portuguese</option><option>Russian</option><option>Turkish</option><option>Indonesian</option><option>Malay</option><option>Italian</option></select></label><label>Search chat history<input class="field" id="chatSearch" placeholder="Search saved conversations" oninput="filterChat()"></label><div class="chat" id="chatBox"></div><textarea class="field" id="aiInput" rows="3" placeholder="প্রশ্ন লিখুন..."></textarea><div class="row no-print"><button class="btn" onclick="sendAI()">Send</button><button class="btn secondary" onclick="openAttachmentMenu()">+ Attach</button><button class="btn secondary" onclick="voiceInput()">Voice input</button><button class="btn secondary" onclick="speakLast()">Read answer</button><button class="btn secondary" onclick="loadChat()">Load history</button><button class="btn secondary" onclick="clearChat()">Clear history</button></div><div class="row no-print"><button class="btn secondary" onclick="document.getElementById('cameraInput').click()">Camera</button><button class="btn secondary" onclick="document.getElementById('galleryInput').click()">Gallery / Image</button><button class="btn secondary" onclick="document.getElementById('documentInput').click()">Files / PDF / TXT</button></div><input id="cameraInput" type="file" accept="image/*" capture="environment" hidden onchange="handleAttachment(this.files)"><input id="galleryInput" type="file" accept="image/*" hidden onchange="handleAttachment(this.files)"><input id="documentInput" type="file" accept=".pdf,.txt,.md,.csv,.json,.html,.xml,.doc,.docx,application/pdf,text/plain" hidden onchange="handleAttachment(this.files)"><div id="attachmentPreview" class="item" hidden></div><p id="aiStatus" class="status"></p><p class="muted">ছবি Vision-সমর্থিত Grow মডেল থাকলে বিশ্লেষণ হবে। PDF থেকে লেখা পড়ার জন্য PDF.js ব্যবহার করা হয়; স্ক্যান করা PDF/OCR ও DOC/DOCX-এর সম্পূর্ণ পাঠ নির্ভর করবে উপযুক্ত extraction support-এর উপর।</p><div class="row"><button class="btn secondary" onclick="tutorMode('socratic')">Socratic Tutor</button><button class="btn secondary" onclick="tutorMode('mistake-detective')">Mistake Detective</button><button class="btn secondary" onclick="tutorMode('examiner')">Examiner / Viva</button><button class="btn secondary" onclick="tutorMode('teacher-simulator')">Teacher Simulator</button><button class="btn secondary" onclick="tutorMode('revision')">60-Second Revision</button><button class="btn secondary" onclick="tutorMode('concept-map')">Concept Map</button></div><p class="status" id="modeStatus"></p></div></section>
+<section class="section" id="study"><div class="panel"><h2>Study Pack</h2><div class="row"><label>Subject<input id="studySubject" class="field"></label><label>Class<input id="studyClass" class="field"></label></div><label>Topic<input id="studyTopic" class="field"></label><button class="btn" onclick="studyPack()">Generate Study Pack</button><p id="studyStatus" class="status"></p><div class="item" id="studyOutput"></div><button class="btn secondary" onclick="printContent('studyOutput')">Export PDF / Print</button></div></section>
+<section class="section" id="questions"><div class="panel"><h2>Previous Questions</h2><p class="muted">Generated questions are marked as practice; they are not represented as verified past papers.</p><div class="row"><label>Subject<input id="qSubject" class="field"></label><label>Class<input id="qClass" class="field"></label><label>Exam<input id="qExam" class="field"></label></div><label>Topic<input id="qTopic" class="field"></label><button class="btn" onclick="previousQuestions()">Create practice questions</button><p class="status" id="qStatus"></p><div class="item" id="qOutput"></div><button class="btn secondary" onclick="printContent('qOutput')">Export PDF / Print</button></div></section>
+<section class="section" id="questionbank"><div class="panel"><h2>Question Bank</h2><p class="muted">নিজের প্রশ্ন, উত্তর ও বিষয়ভিত্তিক অনুশীলন সংরক্ষণ করুন।</p><label>Subject<input id="qbSubject" class="field"></label><label>Question<textarea id="qbQuestion" class="field"></textarea></label><label>Answer / explanation<textarea id="qbAnswer" class="field"></textarea></label><div class="row"><button class="btn" onclick="saveQuestionBank()">Save question</button><button class="btn secondary" onclick="exportQuestionBank()">Export JSON</button></div><div id="qbList"></div></div></section>
+<section class="section" id="notes"><div class="panel"><h2>AI Notes / Notes</h2><label>Title<input id="noteTitle" class="field"></label><label>Subject<input id="noteSubject" class="field"></label><label>Content<textarea id="noteContent" class="field" rows="5"></textarea></label><div class="row"><button class="btn" onclick="saveNote()">Save note</button><button class="btn secondary" onclick="loadNotes()">Refresh</button><button class="btn secondary" onclick="printContent('notesList')">PDF / Print</button></div><p class="status" id="notesStatus"></p><div id="notesList"></div></div></section>
+<section class="section" id="flashcards"><div class="panel"><h2>Flashcards / Memory Architect</h2><label>Subject<input id="fcSubject" class="field"></label><label>Front / Question<textarea id="fcFront" class="field"></textarea></label><label>Back / Answer<textarea id="fcBack" class="field"></textarea></label><button class="btn" onclick="saveCard()">Save flashcard</button><p id="fcStatus" class="status"></p><div id="cardList"></div><p class="muted">Review buttons schedule a simple next-review date; forgetting radar is an estimate, not a medical or cognitive measurement.</p></div></section>
+<section class="section" id="library"><div class="panel"><h2>Personal Library</h2><label>Title<input id="libTitle" class="field"></label><label>Type<select id="libType" class="field"><option>resource</option><option>book</option><option>link</option><option>summary</option></select></label><label>Content / URL<textarea id="libContent" class="field"></textarea></label><button class="btn" onclick="saveLibrary()">Save item</button><p id="libStatus" class="status"></p><div id="libraryList"></div></div></section>
+<section class="section" id="knowledge"><div class="panel"><h2>Knowledge System</h2><label>Concept<input id="concept" class="field"></label><label>Prerequisite<input id="prereq" class="field"></label><label>Related concepts<input id="related" class="field"></label><label>Notes<textarea id="conceptNotes" class="field"></textarea></label><button class="btn" onclick="saveConcept()">Save concept</button><button class="btn secondary" onclick="exportKnowledge()">Export JSON</button><p id="knowledgeStatus" class="status"></p><div id="conceptList"></div></div></section>
+<section class="section" id="exam"><div class="panel"><h2>Exam Center / Mistake Log</h2><div class="row"><label>Subject<input id="examSubject" class="field"></label><label>Exam name<input id="examName" class="field"></label></div><div class="row"><label>Score<input id="examScore" type="number" class="field"></label><label>Total marks<input id="examTotal" type="number" class="field"></label></div><label>Mistake / weak area<textarea id="examMistake" class="field"></textarea></label><label>Correction / next action<textarea id="examCorrection" class="field"></textarea></label><button class="btn" onclick="saveExam()">Save exam log</button><p id="examStatus" class="status"></p><div id="examList"></div></div></section>
+<section class="section" id="planner"><div class="panel"><h2>Study / Revision Planner</h2><label>Task<input id="taskTitle" class="field"></label><div class="row"><label>Subject<input id="taskSubject" class="field"></label><label>Type<select id="taskType" class="field"><option>study</option><option>revision</option><option>exam</option><option>homework</option></select></label><label>Due date<input id="taskDate" type="date" class="field"></label></div><label>Notes<textarea id="taskNotes" class="field"></textarea></label><button class="btn" onclick="saveTask()">Add task</button><p id="taskStatus" class="status"></p><div id="taskList"></div></div></section>
+<section class="section" id="toolbox"><div class="panel"><h2>Study Toolbox</h2><h3>Calculator</h3><input id="calc" class="field" placeholder="Example: (12+8)*3/2"><button class="btn" onclick="calculate()">Calculate</button><p id="calcResult" class="status"></p><hr><h3>Focus timer</h3><div id="timer" style="font-size:34px;font-weight:800">25:00</div><div class="row"><input id="timerMins" class="field" type="number" min="1" max="180" value="25"><button class="btn" onclick="startTimer()">Start</button><button class="btn secondary" onclick="pauseTimer()">Pause</button><button class="btn secondary" onclick="resetTimer()">Reset</button></div><p id="timerStatus" class="status"></p><hr><h3>Unit converter</h3><div class="row"><input id="unitValue" class="field" type="number" placeholder="Value"><select id="unitFrom" class="field"><option value="km">km</option><option value="m">m</option><option value="cm">cm</option><option value="kg">kg</option><option value="g">g</option><option value="l">L</option><option value="ml">mL</option></select><select id="unitTo" class="field"><option value="m">m</option><option value="km">km</option><option value="cm">cm</option><option value="g">g</option><option value="kg">kg</option><option value="ml">mL</option><option value="l">L</option></select><button class="btn" onclick="convertUnits()">Convert</button></div><p id="unitResult" class="status"></p></div></section>
+<section class="section" id="research"><div class="panel"><h2>Web Research</h2><p class="muted">Live search uses the configured provider adapter. Add a compatible search API key and endpoint in Render Environment Variables.</p><label>Research question<input id="researchQ" class="field"></label><button class="btn" onclick="liveResearch()">Search web</button><button class="btn secondary" onclick="askResearchAI()">Ask AI without live search</button><p id="researchStatus" class="status"></p><div id="researchOutput" class="item"></div></div></section>
+<section class="section" id="dashboard"><div class="panel"><h2>Learning Dashboard</h2><button class="btn secondary" onclick="refreshDashboard()">Refresh</button><div id="dashboardData" class="grid"></div><h3>Tasks</h3><div id="dashboardTasks"></div><h3>Memory review due</h3><div id="dueCards"></div></div></section>
+<section class="section" id="settings"><div class="panel"><h2>Settings</h2><label>Preferred language<select id="prefLang" class="field"><option>Bengali</option><option>English</option><option>Hindi</option><option>Urdu</option><option>Arabic</option></select></label><label>Daily study goal (minutes)<input id="goalMins" class="field" type="number" min="10" max="720" value="120"></label><button class="btn" onclick="saveSettings()">Save settings</button><p id="settingsStatus" class="status"></p><p class="muted">API keys are never entered here; keep them in Render Environment Variables.</p></div></section>
+</main></div></div><nav id="bottomNav" class="bottom no-print"></nav><div class="watermark">Learn With Utsab</div>
+<script>
+const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nav=[['home','Home'],['offline','Offline Study Mode'],['ai','Utsab AI'],['research','Web Research'],['questions','Previous Questions'],['questionbank','Question Bank'],['study','Study Pack'],['knowledge','Knowledge System'],['exam','Exam Center'],['planner','Study Planner'],['notes','AI Notes'],['flashcards','Flashcards / Memory'],['library','Personal Library'],['toolbox','Study Toolbox'],['dashboard','Dashboard'],['settings','Settings'],['auth','Profile / Login']];
+const featureText={'offline':'Works without API/internet for saved study tools','ai':'Multilingual tutor','research':'Live search provider needed','questions':'Practice questions','questionbank':'Save and organize your own questions','study':'Notes, MCQs, revision','knowledge':'Prerequisites and concept map','exam':'Scores and mistakes','planner':'Tasks and revision dates','notes':'Save and print notes','flashcards':'Spaced review','library':'Save resources','toolbox':'Calculator, timer, units','dashboard':'Study progress','settings':'Preferences and security','auth':'Student / Teacher account'};
+let token=localStorage.getItem('usbk_token')||'',user=null,authMode='login',lastAnswer='',chat=[],timerHandle=null,secondsLeft=1500,founder=[],pendingAttachments=[];
+function show(id){document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('[data-nav]').forEach(x=>x.classList.toggle('active',x.dataset.nav===id));window.scrollTo({top:0,behavior:'smooth'});if(id==='notes')loadNotes();if(id==='flashcards')loadCards();if(id==='library')loadLibrary();if(id==='knowledge')loadKnowledge();if(id==='planner')loadTasks();if(id==='exam')loadExams();if(id==='dashboard')refreshDashboard();if(id==='settings')loadSettings();}
+function makeNav(){const side=$('sideNav'),bottom=$('bottomNav');side.innerHTML=nav.map(([id,l])=>`<button class="nav ${id==='home'?'active':''}" data-nav="${id}" onclick="show('${id}')">${l}</button>`).join('');bottom.innerHTML=nav.filter(([id])=>['home','ai','study','planner','notes','dashboard'].includes(id)).map(([id,l])=>`<button class="${id==='home'?'active':''}" data-nav="${id}" onclick="show('${id}')">${l}</button>`).join('');$('features').innerHTML=nav.filter(([id])=>id!=='home').map(([id,l])=>`<button class="feature" onclick="show('${id}')"><strong>${l}</strong><span class="muted">${featureText[id]||''}</span></button>`).join('');}
+async function api(url,opt={}){const headers={'Content-Type':'application/json',...(opt.headers||{})};if(token)headers.Authorization='Bearer '+token;let r;try{r=await fetch(url,{...opt,headers,signal:opt.signal||AbortSignal.timeout(50000)});}catch(e){if(!navigator.onLine)throw Error('ইন্টারনেট নেই। Offline Study Mode ব্যবহার করুন; AI/Cloud API পরে চেষ্টা করুন।');if(e.name==='TimeoutError')throw Error('Request timeout—কিছুক্ষণ পরে আবার চেষ্টা করুন।');throw Error('সার্ভারের সঙ্গে সংযোগ হয়নি। Backend URL/Render logs পরীক্ষা করুন।');}const d=await r.json().catch(()=>({error:'Unexpected server response'}));if(!r.ok)throw Error(d.error||`Request failed (${r.status})`);return d;}
+function renderAuth(){$('registerFields').classList.toggle('hide',authMode!=='register');$('authSubmit').textContent=authMode==='register'?'Create account':'Login';}
+$('authForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget),data={emailOrPhone:f.get('emailOrPhone'),password:f.get('password')};if(authMode==='register')Object.assign(data,{name:f.get('name'),role:f.get('role'),className:f.get('className'),school:f.get('school')});$('authStatus').textContent='Working...';try{const d=await api('/api/auth/'+(authMode==='register'?'register':'login'),{method:'POST',body:JSON.stringify(data)});token=d.token;localStorage.setItem('usbk_token',token);user=d.user;userUI();$('authStatus').textContent='Signed in.';show('home');refreshDashboard();}catch(e){$('authStatus').textContent=e.message;}});
+function userUI(){$('userBadge').textContent=user?`${user.name} · ${user.role}`:'Guest';$('authButton').textContent=user?'Account':'Login / Register';$('logoutBtn').classList.toggle('hide',!user);if(user){$('profileName').value=user.name||'';$('profileClass').value=user.className||'';$('profileSchool').value=user.school||'';}}
+function needLogin(){if(!user){show('auth');return false;}return true;}
+async function boot(){makeNav();renderAuth();const resetToken=new URLSearchParams(location.search).get('resetToken');if(resetToken){show('auth');confirmPasswordResetFromPrompt(resetToken);history.replaceState({},'',location.pathname);}try{if(token){const d=await api('/api/auth/me');user=d.user;}}catch{token='';localStorage.removeItem('usbk_token');}userUI();const saved=localStorage.getItem('usbk_founder');founder=saved?JSON.parse(saved):[];renderFounder();try{const h=await fetch('/api/health').then(r=>r.json());$('dashboardData').innerHTML=`<div class="item">Database: ${esc(h.database)}</div><div class="item">AI: ${h.aiConfigured?'configured':'needs provider settings'}</div><div class="item">Live search: ${h.liveSearchConfigured?'configured':'needs provider settings'}</div><div class="item">Password reset email: ${h.passwordResetConfigured?'configured':'needs SMTP settings'}</div><div class="item">Offline: available for local study tools</div>`;}catch{}if(user){loadChat();refreshDashboard();}}
+async function logout(){token='';user=null;localStorage.removeItem('usbk_token');userUI();$('chatBox').innerHTML='';show('home');}
+async function requestReset(){const emailOrPhone=document.querySelector('[name=emailOrPhone]').value.trim();if(!emailOrPhone)return $('authStatus').textContent='আগে Email লিখুন। Phone-only accounts need an email/SMS reset provider.';try{const d=await api('/api/auth/password-reset/request',{method:'POST',body:JSON.stringify({emailOrPhone})});$('authStatus').textContent=d.message||'যদি অ্যাকাউন্টটি থাকে, reset instructions পাঠানো হবে।';}catch(e){$('authStatus').textContent=e.message;}}
+async function confirmPasswordResetFromPrompt(raw){const newPassword=prompt('নতুন password লিখুন (কমপক্ষে ১০ অক্ষর):');if(!newPassword)return;try{const d=await api('/api/auth/password-reset/confirm',{method:'POST',body:JSON.stringify({token:raw,newPassword})});$('authStatus').textContent=d.message||'Password reset successful.';}catch(e){$('authStatus').textContent=e.message;}}
+async function saveProfile(){if(!needLogin())return;try{const d=await api('/api/auth/profile',{method:'PATCH',body:JSON.stringify({name:$('profileName').value,className:$('profileClass').value,school:$('profileSchool').value})});user=d.user;userUI();$('profileStatus').textContent='Profile saved.';}catch(e){$('profileStatus').textContent=e.message;}}
+async function changePassword(){if(!needLogin())return;try{await api('/api/auth/change-password',{method:'POST',body:JSON.stringify({oldPassword:$('oldPass').value,newPassword:$('newPass').value})});$('passwordStatus').textContent='Password changed.';}catch(e){$('passwordStatus').textContent=e.message;}}
+function addMsg(role,text){const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'ai');d.textContent=text;$('chatBox').appendChild(d);$('chatBox').scrollTop=$('chatBox').scrollHeight;}
+async function sendAI(){if(!needLogin())return;const m=$('aiInput').value.trim();if(!m&&!pendingAttachments.length)return;const attachmentText=pendingAttachments.filter(a=>a.text).map(a=>'[Extracted from '+a.name+']\n'+a.text).join('\n\n');const prompt=[m,attachmentText].filter(Boolean).join('\n\n');const images=pendingAttachments.filter(a=>a.dataUrl).map(a=>({name:a.name,dataUrl:a.dataUrl}));$('aiInput').value='';addMsg('user',prompt||('[Attached '+images.length+' image(s)]'));chat.push({role:'user',content:prompt||'[image attachment]'});$('aiStatus').textContent='Utsab AI is thinking...';try{const d=await api('/api/ai/chat',{method:'POST',body:JSON.stringify({message:prompt||'Please describe and analyze the attached image(s) for learning.',language:$('aiLang').value,history:chat.slice(-8,-1),attachments:images})});lastAnswer=d.answer;chat.push({role:'assistant',content:d.answer});addMsg('assistant',d.answer);$('aiStatus').textContent='';pendingAttachments=[];renderAttachmentPreview();}catch(e){$('aiStatus').textContent=e.message;}}
+async function loadChat(){if(!needLogin())return;try{const d=await api('/api/chat/history');chat=d.items.map(x=>({role:x.role,content:x.content}));$('chatBox').innerHTML='';chat.forEach(x=>addMsg(x.role,x.content));}catch(e){$('aiStatus').textContent=e.message;}}
+async function clearChat(){if(!needLogin())return;try{await api('/api/chat/history',{method:'DELETE'});chat=[];$('chatBox').innerHTML='';$('aiStatus').textContent='Chat history cleared.';}catch(e){$('aiStatus').textContent=e.message;}}
+function voiceInput(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return $('aiStatus').textContent='Voice recognition is not supported by this browser.';const r=new SR();r.lang=$('aiLang').value==='Bengali'?'bn-BD':'en-US';r.onresult=e=>$('aiInput').value=e.results[0][0].transcript;r.onerror=()=> $('aiStatus').textContent='Voice permission or recognition failed.';r.start();}
+function speakLast(){if(!lastAnswer)return $('aiStatus').textContent='No answer to read.';if(!window.speechSynthesis)return $('aiStatus').textContent='Text-to-speech is unsupported.';speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(lastAnswer);u.lang=$('aiLang').value==='Bengali'?'bn-BD':'en-US';speechSynthesis.speak(u);}
+function openAttachmentMenu(){const choice=prompt('Attachment type লিখুন: camera / gallery / file');if(!choice)return;const c=choice.trim().toLowerCase();if(c==='camera')$('cameraInput').click();else if(c==='gallery'||c==='image')$('galleryInput').click();else $('documentInput').click();}
+async function handleAttachment(files){if(!files||!files.length)return;for(const f of Array.from(files)){if(f.size>4*1024*1024){$('aiStatus').textContent=f.name+' 4 MB সীমা ছাড়িয়েছে।';continue;}const item={name:f.name,type:f.type,text:'',dataUrl:''};if(f.type.startsWith('image/')){item.dataUrl=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result));r.onerror=reject;r.readAsDataURL(f);});}else if(f.type==='text/plain'||/\.(txt|md|csv|json|html|xml)$/i.test(f.name)){item.text=(await f.text()).slice(0,100000);}else if(f.type==='application/pdf'||/\.pdf$/i.test(f.name)){try{item.text=await extractPdfText(f);}catch(e){item.text='[PDF text extraction failed: '+e.message+'. You may need a PDF text extraction service.]';}}else{item.text='[File attached: '+f.name+'. Automatic extraction for this document format is not available in this build. Convert it to PDF/TXT or connect a document extraction service.]';}pendingAttachments.push(item);}renderAttachmentPreview();}
+async function extractPdfText(file){if(!window.pdfjsLib){await new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';sc.onload=resolve;sc.onerror=()=>reject(Error('PDF.js could not load'));document.head.appendChild(sc);});window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';}const bytes=await file.arrayBuffer(),pdf=await pdfjsLib.getDocument({data:bytes}).promise;let out='';for(let i=1;i<=Math.min(pdf.numPages,30);i++){const page=await pdf.getPage(i),content=await page.getTextContent();out+=content.items.map(x=>x.str).join(' ')+'\n';if(out.length>90000)break;}return out||'[No selectable text found; scanned PDF may require OCR.]';}
+function renderAttachmentPreview(){const el=$('attachmentPreview');if(!pendingAttachments.length){el.hidden=true;el.innerHTML='';return;}el.hidden=false;el.innerHTML='<strong>Attached files</strong>'+pendingAttachments.map((a,i)=>'<div class="row"><span>'+esc(a.name)+'</span><button class="btn danger small" onclick="removeAttachment('+i+')">Remove</button></div>').join('');}
+function removeAttachment(i){pendingAttachments.splice(i,1);renderAttachmentPreview();}
+function filterChat(){const q=$('chatSearch').value.toLowerCase();Array.from($('chatBox').children).forEach(n=>n.hidden=!n.textContent.toLowerCase().includes(q));}
+function saveQuestionBank(){const subject=$('qbSubject').value.trim(),question=$('qbQuestion').value.trim(),answer=$('qbAnswer').value.trim();if(!question)return alert('প্রশ্ন লিখুন।');const a=JSON.parse(localStorage.getItem('usbk_questionbank')||'[]');a.unshift({subject,question,answer,createdAt:new Date().toISOString()});localStorage.setItem('usbk_questionbank',JSON.stringify(a));$('qbQuestion').value='';$('qbAnswer').value='';renderQuestionBank();}
+function renderQuestionBank(){const a=JSON.parse(localStorage.getItem('usbk_questionbank')||'[]');$('qbList').innerHTML=a.map((x,i)=>'<div class="item"><span class="pill">'+esc(x.subject||'General')+'</span><h3>'+esc(x.question)+'</h3><details><summary>Show answer</summary><p>'+esc(x.answer)+'</p></details><button class="btn danger small" onclick="deleteQuestionBank('+i+')">Delete</button></div>').join('')||'<p class="muted">No saved questions.</p>';}
+function deleteQuestionBank(i){const a=JSON.parse(localStorage.getItem('usbk_questionbank')||'[]');a.splice(i,1);localStorage.setItem('usbk_questionbank',JSON.stringify(a));renderQuestionBank();}
+function exportQuestionBank(){download('usbk-question-bank.json',JSON.stringify(JSON.parse(localStorage.getItem('usbk_questionbank')||'[]'),null,2),'application/json');}
+async function tutorMode(mode){if(!needLogin())return;const prompt=promptText();if(!prompt)return $('modeStatus').textContent='আগে Utsab AI-তে প্রশ্ন লিখুন অথবা উপরের বিষয়/কাজটি লিখুন।';$('modeStatus').textContent='Generating...';try{const d=await api('/api/ai/tutor-mode',{method:'POST',body:JSON.stringify({mode,prompt,language:$('aiLang').value})});lastAnswer=d.answer;addMsg('assistant',d.answer);$('modeStatus').textContent='Ready.';show('ai');}catch(e){$('modeStatus').textContent=e.message;}}
+function promptText(){return $('aiInput').value.trim()||$('studyTopic').value.trim()||$('examMistake').value.trim()||$('researchQ').value.trim();}
+async function studyPack(){if(!needLogin())return;const topic=$('studyTopic').value.trim();if(!topic)return $('studyStatus').textContent='Topic required.';$('studyStatus').textContent='Generating...';try{const d=await api('/api/ai/study-pack',{method:'POST',body:JSON.stringify({topic,subject:$('studySubject').value,className:$('studyClass').value,language:$('aiLang').value==='Auto-detect'?'Bengali':$('aiLang').value})});$('studyOutput').textContent=d.answer;$('studyStatus').textContent='Ready.';}catch(e){$('studyStatus').textContent=e.message;}}
+async function previousQuestions(){if(!needLogin())return;$('qStatus').textContent='Generating practice questions...';try{const d=await api('/api/ai/previous-questions',{method:'POST',body:JSON.stringify({subject:$('qSubject').value,className:$('qClass').value,exam:$('qExam').value,topic:$('qTopic').value,language:$('aiLang').value==='Auto-detect'?'Bengali':$('aiLang').value})});$('qOutput').textContent=d.answer;$('qStatus').textContent='Practice content only; not verified previous-year questions.';}catch(e){$('qStatus').textContent=e.message;}}
+async function saveNote(){if(!needLogin())return;try{await api('/api/notes',{method:'POST',body:JSON.stringify({title:$('noteTitle').value,subject:$('noteSubject').value,content:$('noteContent').value})});$('notesStatus').textContent='Saved.';loadNotes();refreshDashboard();}catch(e){$('notesStatus').textContent=e.message;}}
+async function loadNotes(){if(!user)return $('notesList').textContent='Log in to save notes.';try{const d=await api('/api/notes');$('notesList').innerHTML=d.items.map(n=>`<div class="item"><h3>${esc(n.title)}</h3><span class="pill">${esc(n.subject)}</span><p>${esc(n.content)}</p><button class="btn secondary small" onclick="deleteNote('${n.id}')">Delete</button></div>`).join('')||'<p class="muted">No notes.</p>';}catch(e){$('notesStatus').textContent=e.message;}}
+async function deleteNote(id){try{await api('/api/notes/'+id,{method:'DELETE'});loadNotes();refreshDashboard();}catch(e){$('notesStatus').textContent=e.message;}}
+async function saveCard(){if(!needLogin())return;try{await api('/api/flashcards',{method:'POST',body:JSON.stringify({subject:$('fcSubject').value,front:$('fcFront').value,back:$('fcBack').value})});$('fcStatus').textContent='Saved.';loadCards();refreshDashboard();}catch(e){$('fcStatus').textContent=e.message;}}
+async function loadCards(){if(!user)return $('cardList').textContent='Log in to save flashcards.';try{const d=await api('/api/flashcards');$('cardList').innerHTML=d.items.map(c=>`<div class="item"><span class="pill">${esc(c.subject)}</span><h3>${esc(c.front)}</h3><details><summary>Show answer</summary><p>${esc(c.back)}</p></details><p class="muted">Reviews: ${c.review_count||0} · Due: ${esc(c.due_at||'Not scheduled')}</p><div class="row"><button class="btn secondary small" onclick="reviewCard('${c.id}','again')">Again</button><button class="btn secondary small" onclick="reviewCard('${c.id}','hard')">Hard</button><button class="btn secondary small" onclick="reviewCard('${c.id}','good')">Good</button><button class="btn secondary small" onclick="reviewCard('${c.id}','easy')">Easy</button><button class="btn danger small" onclick="deleteCard('${c.id}')">Delete</button></div></div>`).join('')||'<p class="muted">No flashcards.</p>';const due=d.items.filter(c=>!c.due_at||new Date(c.due_at)<=new Date()).length;$('dueCards').textContent=`${due} card(s) due for review.`;}catch(e){$('fcStatus').textContent=e.message;}}
+async function reviewCard(id,rating){try{await api('/api/flashcards/'+id+'/review',{method:'POST',body:JSON.stringify({rating})});loadCards();}catch(e){$('fcStatus').textContent=e.message;}}
+async function deleteCard(id){try{await api('/api/flashcards/'+id,{method:'DELETE'});loadCards();refreshDashboard();}catch(e){$('fcStatus').textContent=e.message;}}
+async function saveLibrary(){if(!needLogin())return;try{await api('/api/library',{method:'POST',body:JSON.stringify({title:$('libTitle').value,itemType:$('libType').value,content:$('libContent').value})});$('libStatus').textContent='Saved.';loadLibrary();refreshDashboard();}catch(e){$('libStatus').textContent=e.message;}}
+async function loadLibrary(){if(!user)return $('libraryList').textContent='Log in to save resources.';try{const d=await api('/api/library');$('libraryList').innerHTML=d.items.map(x=>`<div class="item"><h3>${esc(x.title)}</h3><span class="pill">${esc(x.item_type)}</span><p>${esc(x.content)}</p><button class="btn danger small" onclick="deleteLibrary('${x.id}')">Delete</button></div>`).join('')||'<p class="muted">Library empty.</p>';}catch(e){$('libStatus').textContent=e.message;}}
+async function deleteLibrary(id){try{await api('/api/library/'+id,{method:'DELETE'});loadLibrary();refreshDashboard();}catch(e){$('libStatus').textContent=e.message;}}
+async function saveConcept(){if(!needLogin())return;try{await api('/api/knowledge',{method:'POST',body:JSON.stringify({concept:$('concept').value,prerequisite:$('prereq').value,related:$('related').value,notes:$('conceptNotes').value})});$('knowledgeStatus').textContent='Saved.';loadKnowledge();refreshDashboard();}catch(e){$('knowledgeStatus').textContent=e.message;}}
+async function loadKnowledge(){if(!user)return $('conceptList').textContent='Log in to save concepts.';try{const d=await api('/api/knowledge');$('conceptList').innerHTML=d.items.map(x=>`<div class="item"><h3>${esc(x.concept)}</h3><p>Prerequisite: ${esc(x.prerequisite)}<br>Related: ${esc(x.related)}<br>${esc(x.notes)}</p><button class="btn danger small" onclick="deleteConcept('${x.id}')">Delete</button></div>`).join('')||'<p class="muted">No concepts yet.</p>';}catch(e){$('knowledgeStatus').textContent=e.message;}}
+async function deleteConcept(id){try{await api('/api/knowledge/'+id,{method:'DELETE'});loadKnowledge();}catch(e){$('knowledgeStatus').textContent=e.message;}}
+async function exportKnowledge(){if(!needLogin())return;try{const d=await api('/api/knowledge');download('usbk-knowledge.json',JSON.stringify(d.items,null,2),'application/json');}catch(e){$('knowledgeStatus').textContent=e.message;}}
+async function saveExam(){if(!needLogin())return;try{await api('/api/exam-logs',{method:'POST',body:JSON.stringify({subject:$('examSubject').value,examName:$('examName').value,score:$('examScore').value,total:$('examTotal').value,mistake:$('examMistake').value,correction:$('examCorrection').value})});$('examStatus').textContent='Exam log saved.';loadExams();refreshDashboard();}catch(e){$('examStatus').textContent=e.message;}}
+async function loadExams(){if(!user)return $('examList').textContent='Log in to save exam logs.';try{const d=await api('/api/exam-logs');$('examList').innerHTML=d.items.map(x=>`<div class="item"><h3>${esc(x.exam_name)} — ${esc(x.subject)}</h3><p>Score: ${esc(x.score??'—')} / ${esc(x.total??'—')}</p><p>Mistake: ${esc(x.mistake)}<br>Correction: ${esc(x.correction)}</p></div>`).join('')||'<p class="muted">No exam logs.</p>';}catch(e){$('examStatus').textContent=e.message;}}
+async function saveTask(){if(!needLogin())return;try{await api('/api/tasks',{method:'POST',body:JSON.stringify({title:$('taskTitle').value,subject:$('taskSubject').value,taskType:$('taskType').value,dueDate:$('taskDate').value||null,notes:$('taskNotes').value})});$('taskStatus').textContent='Task saved.';loadTasks();refreshDashboard();}catch(e){$('taskStatus').textContent=e.message;}}
+async function loadTasks(){if(!user)return $('taskList').textContent='Log in to save tasks.';try{const d=await api('/api/tasks');$('taskList').innerHTML=d.items.map(t=>`<div class="item"><label><input type="checkbox" ${t.completed?'checked':''} onchange="completeTask('${t.id}',this.checked)"> ${esc(t.title)}</label><p>${esc(t.subject)} · ${esc(t.task_type)} · ${esc(t.due_date||'No due date')}</p><p>${esc(t.notes)}</p><button class="btn danger small" onclick="deleteTask('${t.id}')">Delete</button></div>`).join('')||'<p class="muted">No tasks.</p>';}catch(e){$('taskStatus').textContent=e.message;}}
+async function completeTask(id,completed){try{await api('/api/tasks/'+id,{method:'PATCH',body:JSON.stringify({completed})});loadTasks();refreshDashboard();}catch(e){$('taskStatus').textContent=e.message;}}
+async function deleteTask(id){try{await api('/api/tasks/'+id,{method:'DELETE'});loadTasks();refreshDashboard();}catch(e){$('taskStatus').textContent=e.message;}}
+async function liveResearch(){if(!needLogin())return;$('researchStatus').textContent='Checking live-search integration...';try{const d=await api('/api/research',{method:'POST',body:JSON.stringify({query:$('researchQ').value})});$('researchOutput').innerHTML='<h3>Search summary</h3><p>'+esc(d.answer||'No provider summary returned.')+'</p>'+(d.results||[]).map(x=>'<article class="item"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.title||x.url)+'</a><p>'+esc(x.content)+'</p></article>').join('');}catch(e){$('researchStatus').textContent=e.message;}}
+async function askResearchAI(){if(!needLogin())return;const q=$('researchQ').value.trim();if(!q)return;try{const d=await api('/api/ai/chat',{method:'POST',body:JSON.stringify({message:'Explain this research question using your general knowledge. Do not claim live web search or provide invented citations: '+q,language:$('aiLang').value,history:[]})});$('researchOutput').textContent=d.answer;$('researchStatus').textContent='AI response only; live search was not performed.';}catch(e){$('researchStatus').textContent=e.message;}}
+async function refreshDashboard(){if(!user){$('dashboardData').innerHTML='<div class="item">Login to view your progress.</div>';return;}try{const d=await api('/api/dashboard');$('dashboardData').innerHTML=[['Notes',d.notes],['Flashcards',d.flashcards],['Library',d.library],['Tasks completed',d.tasks.done+' / '+d.tasks.n],['Exam logs',d.exams.n],['Knowledge concepts',d.concepts]].map(([a,b])=>`<div class="item"><span class="muted">${a}</span><h2>${esc(b)}</h2></div>`).join('');loadTasks();loadCards();}catch(e){$('dashboardData').textContent=e.message;}}
+async function saveSettings(){if(!needLogin())return;try{await api('/api/settings',{method:'PUT',body:JSON.stringify({language:$('prefLang').value,dailyGoalMinutes:Number($('goalMins').value)||120})});$('settingsStatus').textContent='Settings saved.';}catch(e){$('settingsStatus').textContent=e.message;}}
+async function loadSettings(){if(!user)return;try{const d=await api('/api/settings');if(d.settings.language)$('prefLang').value=d.settings.language;if(d.settings.dailyGoalMinutes)$('goalMins').value=d.settings.dailyGoalMinutes;}catch(e){$('settingsStatus').textContent=e.message;}}
+function addFounder(){const title=$('founderTitle').value.trim();if(!title)return;founder.push({title,type:$('founderType').value,date:new Date().toLocaleDateString()});localStorage.setItem('usbk_founder',JSON.stringify(founder));$('founderTitle').value='';renderFounder();}
+function renderFounder(){$('founderList').innerHTML=founder.map((x,i)=>`<div class="item"><strong>${esc(x.title)}</strong><span class="pill">${esc(x.type)}</span><p class="muted">${esc(x.date)}</p><button class="btn danger small" onclick="founder.splice(${i},1);localStorage.setItem('usbk_founder',JSON.stringify(founder));renderFounder()">Delete</button></div>`).join('')||'<p class="muted">No founder tasks.</p>';}
+function calculate(){const s=$('calc').value.trim();if(!s||s.length>100||!/^[0-9+\-*/().%\s]+$/.test(s))return $('calcResult').textContent='Use only numbers and arithmetic operators.';try{const tokens=s.match(/(?:\d+(?:\.\d*)?|\.\d+|[()+\-*/%])/g)||[];if(tokens.join('')!==s.replace(/\s/g,''))throw 0;const out=(new Function('"use strict";return ('+s+')'))();if(!Number.isFinite(out))throw 0;$('calcResult').textContent='Result: '+out;}catch{$('calcResult').textContent='Invalid expression.';}}
+const factors={km:1000,m:1,cm:.01,kg:1,g:.001,l:1,ml:.001};
+function convertUnits(){const a=$('unitFrom').value,b=$('unitTo').value;if(!((a in factors)&&(b in factors))||(['km','m','cm'].includes(a)!==['km','m','cm'].includes(b))||(['kg','g'].includes(a)!==['kg','g'].includes(b))||(['l','ml'].includes(a)!==['l','ml'].includes(b)))return $('unitResult').textContent='Choose units from the same category.';$('unitResult').textContent=Number($('unitValue').value)*factors[a]/factors[b]+' '+b;}
+function drawTimer(){const m=Math.floor(secondsLeft/60),s=secondsLeft%60;$('timer').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
+function startTimer(){if(timerHandle)return;if(secondsLeft<=0)secondsLeft=Math.max(1,Math.min(180,Number($('timerMins').value)||25))*60;timerHandle=setInterval(()=>{secondsLeft--;drawTimer();if(secondsLeft<=0){pauseTimer();$('timerStatus').textContent='Focus session complete.';}},1000);$('timerStatus').textContent='Timer running.';}
+function pauseTimer(){clearInterval(timerHandle);timerHandle=null;$('timerStatus').textContent='Paused.';}
+function resetTimer(){pauseTimer();secondsLeft=Math.max(1,Math.min(180,Number($('timerMins').value)||25))*60;drawTimer();}
+function printContent(id){const el=$(id);if(!el||!el.innerText.trim())return;const w=window.open('','_blank');if(!w)return alert('Allow pop-ups to print or save as PDF.');w.document.write('<!doctype html><html><meta charset="utf-8"><title>USBKStudies Export</title><style>body{font:16px/1.6 sans-serif;max-width:850px;margin:30px auto;white-space:pre-wrap}</style><body><h1>USBKStudies — Utsab AI</h1>'+esc(el.innerText)+'</body></html>');w.document.close();w.focus();w.print();}
+function download(name,content,type='text/plain'){const a=document.createElement('a'),url=URL.createObjectURL(new Blob([content],{type}));a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+$('aiInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendAI();}});
+
+// Offline-first local study tools: independent of login, database and AI provider.
+const offlineKey='usbk_2299_offline_v1';
+function offData(){try{return JSON.parse(localStorage.getItem(offlineKey)||'{"notes":[],"cards":[],"questions":[],"revisions":[]}')}catch{return {notes:[],cards:[],questions:[],revisions:[]}}}
+function offSave(d){localStorage.setItem(offlineKey,JSON.stringify(d));renderOffline();}
+function offId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
+function saveOfflineNote(){let d=offData(),title=$('offNoteTitle').value.trim(),content=$('offNoteContent').value.trim();if(!title||!content){$('offlineStatus').textContent='Title ও content দিন।';return}d.notes.unshift({id:offId(),title,subject:$('offNoteSubject').value.trim(),content,at:new Date().toISOString()});offSave(d);$('offNoteTitle').value='';$('offNoteSubject').value='';$('offNoteContent').value='';$('offlineStatus').textContent='Offline note saved on this device.'}
+function saveOfflineCard(){let d=offData(),front=$('offCardFront').value.trim(),back=$('offCardBack').value.trim();if(!front||!back){$('offlineStatus').textContent='Question এবং answer দুটোই দিন।';return}d.cards.unshift({id:offId(),front,back,at:new Date().toISOString()});offSave(d);$('offCardFront').value='';$('offCardBack').value='';$('offlineStatus').textContent='Flashcard saved locally.'}
+function saveOfflineQuestion(){let d=offData(),q=$('offQ').value.trim(),a=$('offA').value.trim();if(!q||!a){$('offlineStatus').textContent='Question ও answer দিন।';return}d.questions.unshift({id:offId(),q,a,at:new Date().toISOString()});offSave(d);$('offQ').value='';$('offA').value='';$('offlineStatus').textContent='Question saved locally.'}
+function saveOfflineRevision(){let d=offData(),topic=$('offTopic').value.trim(),recall=$('offRecall').value.trim();if(!topic||!recall){$('offlineStatus').textContent='Topic ও নিজের recall লিখুন।';return}d.revisions.unshift({id:offId(),topic,recall,at:new Date().toISOString()});offSave(d);$('offRecall').value='';$('offlineStatus').textContent='Revision saved locally.'}
+function removeOffline(type,id){let d=offData();d[type]=d[type].filter(x=>x.id!==id);offSave(d)}
+function renderOffline(){let d=offData();if(!$('offNoteList'))return;const render=(arr,fn)=>arr.map(x=>`<div class="item"><strong>${esc(x.title||x.topic||x.front||x.q)}</strong><p>${esc(x.subject||x.content||x.recall||x.back||x.a||'')}</p>${x.back?`<details><summary>Show answer</summary>${esc(x.back)}</details>`:''}${x.a?`<details><summary>Show answer</summary>${esc(x.a)}</details>`:''}<button class="btn danger small" onclick="removeOffline('${fn}','${x.id}')">Delete</button></div>`).join('')||'<p class="muted">কিছু সংরক্ষণ করা হয়নি।</p>'; $('offNoteList').innerHTML=render(d.notes,'notes');$('offCardList').innerHTML=render(d.cards,'cards');$('offQuestionList').innerHTML=render(d.questions,'questions');$('offRevisionList').innerHTML=render(d.revisions,'revisions')}
+function offlineExport(){download('USBKStudies_Offline_Backup.json',JSON.stringify(offData(),null,2),'application/json')}
+function offlineImport(files){const f=files&&files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);for(const k of ['notes','cards','questions','revisions'])if(!Array.isArray(d[k]))throw Error('Invalid backup');offSave(d);$('offlineStatus').textContent='Backup imported.'}catch(e){$('offlineStatus').textContent='এই JSON backup পড়া যায়নি।'}$('offlineImportFile').value=''};r.readAsText(f)}
+if('serviceWorker' in navigator && location.protocol!=='file:'){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}window.addEventListener('offline',()=>{const el=$('aiStatus');if(el)el.textContent='Offline: স্থানীয় নোট/ফ্ল্যাশকার্ড/প্রশ্ন ব্যবহার করা যাবে; AI ও Cloud Sync অনলাইনে লাগবে.';});window.addEventListener('online',()=>{const el=$('aiStatus');if(el&&el.textContent.startsWith('Offline:'))el.textContent='Internet connected.';});
+
+drawTimer();renderQuestionBank();renderOffline();boot();
+</script>
+</body></html>
+
+========================================================================================
+FILE: manifest.webmanifest
+========================================================================================
+{
+  "name": "USBKStudies 22.10.14 — Utsab AI",
+  "short_name": "USBKStudies",
+  "description": "Offline-first study tools and Utsab AI learning system",
+  "lang": "bn",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#08111f",
+  "theme_color": "#08111f",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
+
+
+========================================================================================
+FILE: sw.js
+========================================================================================
+/* USBKStudies offline shell. API responses and authenticated/private data are NEVER cached. */
+const CACHE_NAME = 'usbkstudies-22-10-14-shell-v1';
+const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icon.svg'];
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key)))).then(() => self.clients.claim()));
+});
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) return;
+  // Never cache API endpoints: they may contain private account data.
+  if (url.pathname.startsWith('/api/')) return;
+  if (request.mode === 'navigate') {
+    event.respondWith(fetch(request).then(response => {
+      if (response.ok) caches.open(CACHE_NAME).then(cache => cache.put('/index.html', response.clone()));
+      return response;
+    }).catch(async () => (await caches.match('/index.html')) || Response.error()));
+    return;
+  }
+  if (APP_SHELL.includes(url.pathname)) {
+    event.respondWith(caches.match(request).then(cached => cached || fetch(request).then(response => {
+      if (response.ok) caches.open(CACHE_NAME).then(cache => cache.put(request, response.clone()));
+      return response;
+    })));
+  }
+});
+
+
+========================================================================================
+FILE: icon.svg
+========================================================================================
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="100" fill="#08111f"/><path d="M110 110h292v58H168v68h206v58H168v108h-58z" fill="#3b82f6"/><circle cx="365" cy="365" r="44" fill="#34d399"/></svg>
+
+========================================================================================
+FILE: .env.example
+========================================================================================
+# Copy these into Render Environment Variables. Never commit real secrets.
+PORT=10000
+NODE_ENV=production
+JWT_SECRET=replace-with-a-random-secret-at-least-32-characters
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
+
+# OpenAI-compatible chat completion provider (provider-specific format may vary)
+GROW_API_KEY=
+GROW_API_BASE_URL=https://YOUR-OPENAI-COMPATIBLE-PROVIDER.example/v1
+GROW_API_ENDPOINT=/chat/completions
+GROW_API_MODEL=
+AI_REQUEST_TIMEOUT_MS=45000
+
+# Tavily-compatible web search provider
+WEB_SEARCH_API_KEY=
+WEB_SEARCH_BASE_URL=https://api.tavily.com
+WEB_SEARCH_ENDPOINT=/search
+WEB_SEARCH_DEPTH=basic
+WEB_SEARCH_TIMEOUT_MS=20000
+
+# SMTP email for password reset. Email-based accounts only.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=
+SMTP_PASS=
+MAIL_FROM=USBKStudies <no-reply@example.com>
+APP_BASE_URL=https://YOUR-RENDER-SERVICE.onrender.com
+
+# Optional comma-separated allowed origins. Leave empty for same-origin deployment.
+CORS_ORIGIN=
+
+
+========================================================================================
+FILE: render.yaml
+========================================================================================
+services:
+  - type: web
+    name: usbkstudies-22-10-14
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: GROW_API_KEY
+        sync: false
+      - key: GROW_API_BASE_URL
+        sync: false
+      - key: GROW_API_ENDPOINT
+        value: /chat/completions
+      - key: GROW_API_MODEL
+        sync: false
+      - key: WEB_SEARCH_API_KEY
+        sync: false
+      - key: WEB_SEARCH_BASE_URL
+        sync: false
+
+      - key: WEB_SEARCH_ENDPOINT
+        value: /search
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+      - key: AI_REQUEST_TIMEOUT_MS
+        value: "45000"
+      - key: WEB_SEARCH_TIMEOUT_MS
+        value: "20000"
+
+
+========================================================================================
+FILE: scripts/check-frontend.js
+========================================================================================
+'use strict';
+const fs = require('node:fs');
+const vm = require('node:vm');
+const html = fs.readFileSync('index.html', 'utf8');
+const server = fs.readFileSync('server.js', 'utf8');
+const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)].map(m => m[1]).filter(s => s.trim());
+if (!scripts.length) throw new Error('No inline JavaScript found in index.html');
+for (let i = 0; i < scripts.length; i++) new vm.Script(scripts[i], { filename: `index.inline-${i + 1}.js` });
+const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map(m => m[1]);
+const dup = ids.filter((x, i) => ids.indexOf(x) !== i);
+if (dup.length) throw new Error(`Duplicate HTML id(s): ${[...new Set(dup)].join(', ')}`);
+const inline = scripts.join('\n');
+const functions = new Set([...inline.matchAll(/(?:async\s+)?function\s+([\w$]+)\s*\(/g)].map(m => m[1]));
+const handlers = [...html.matchAll(/\bonclick=["']([^"']+)["']/g)].map(m => m[1]);
+const safeGlobals = new Set(['show','Number','localStorage','JSON','String','document','window','confirm','prompt','alert','Math','Date','setTimeout','clearInterval','setInterval','encodeURIComponent']);
+const missing = new Set();
+for (const h of handlers) for (const m of h.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+  const name = m[1];
+  if (!functions.has(name) && !safeGlobals.has(name) && !['getElementById','setItem','splice','click'].includes(name)) missing.add(name);
+}
+if (missing.size) throw new Error(`Potentially undefined inline handler function(s): ${[...missing].join(', ')}`);
+const navMatch = inline.match(/const nav=\[(.*?)\];/s);
+if (navMatch) {
+  const navIds = [...navMatch[1].matchAll(/\[['"]([^'"]+)['"]/g)].map(m => m[1]);
+  for (const id of navIds) if (!ids.includes(id)) throw new Error(`Navigation section has no HTML element: ${id}`);
+}
+for (const route of ['/api/auth/register','/api/auth/login','/api/ai/chat','/api/ai/study-pack','/api/ai/previous-questions','/api/ai/tutor-mode','/api/research','/api/dashboard']) {
+  if (!server.includes(route)) throw new Error(`Expected backend route missing: ${route}`);
+}
+if (!server.includes('teacher-simulator":"Act as a patient school teacher')) throw new Error('Teacher Simulator instruction is missing.');
+console.log(`Frontend syntax OK (${scripts.length} inline script block(s)); ${ids.length} unique HTML IDs; navigation and required route checks passed.`);
