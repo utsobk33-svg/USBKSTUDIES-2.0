@@ -1,0 +1,25 @@
+{
+  "name": "usbkstudies-utsab-ai",
+  "version": "26.7.1",
+  "private": true,
+  "description": "USBKStudies 26.7.1 — integrated multilingual Utsab AI study system with live book discovery",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check sw.js && node scripts/check-frontend.js && node scripts/quality-check.js && node scripts/acceptance-check.js",
+    "check:frontend": "node scripts/check-frontend.js",
+    "test": "npm run check"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1",
+    "nodemailer": "^6.10.1"
+  }
+}
